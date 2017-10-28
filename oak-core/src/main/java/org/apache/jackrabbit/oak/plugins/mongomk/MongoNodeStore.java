@@ -28,7 +28,6 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -51,7 +50,6 @@ import javax.annotation.Nullable;
 import com.google.common.base.Function;
 import com.google.common.cache.Cache;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.jackrabbit.mk.api.MicroKernelException;
 import org.apache.jackrabbit.mk.blobs.BlobStore;
@@ -788,57 +786,28 @@ public final class MongoNodeStore
         if (b == null) {
             throw new MicroKernelException("Empty branch cannot be reset");
         }
-        if (!b.getCommits().last().equals(branchHead)) {
-            throw new MicroKernelException(branchHead + " is not the head " +
-                    "of a branch");
-        }
         if (!b.containsCommit(ancestor)) {
             throw new MicroKernelException(ancestor + " is not " +
                     "an ancestor revision of " + branchHead);
         }
-        if (branchHead.equals(ancestor)) {
-            // trivial
-            return branchHead;
-        }
+        Revision rev;
         boolean success = false;
         Commit commit = newCommit(branchHead);
         try {
+            // apply reverse diff
+            getRoot(ancestor).compareAgainstBaseState(getRoot(branchHead),
+                    new CommitDiff(commit, getBlobSerializer()));
+            UpdateOp rootOp = commit.getUpdateOperationForNode("/");
+            // clear collisions
             Iterator<Revision> it = b.getCommits().tailSet(ancestor).iterator();
             // first revision is the ancestor (tailSet is inclusive)
-            // do not undo changes for this revision
-            Revision base = it.next();
-            Map<String, UpdateOp> operations = new HashMap<String, UpdateOp>();
+            // do not clear collision for this revision
+            it.next();
             while (it.hasNext()) {
-                Revision reset = it.next();
-                getRoot(reset).compareAgainstBaseState(getRoot(base),
-                        new ResetDiff(reset.asTrunkRevision(), operations));
-                UpdateOp rootOp = operations.get("/");
-                if (rootOp == null) {
-                    rootOp = new UpdateOp(Utils.getIdFromPath("/"), false);
-                    NodeDocument.setModified(rootOp, commit.getRevision());
-                    operations.put("/", rootOp);
-                }
-                NodeDocument.removeCollision(rootOp, reset.asTrunkRevision());
-                NodeDocument.removeRevision(rootOp, reset.asTrunkRevision());
+                NodeDocument.removeCollision(rootOp, it.next());
             }
-            // update root document first
-            if (store.findAndUpdate(Collection.NODES, operations.get("/")) != null) {
-                // clean up in-memory branch data
-                // first revision is the ancestor (tailSet is inclusive)
-                List<Revision> revs = Lists.newArrayList(b.getCommits().tailSet(ancestor));
-                for (Revision r : revs.subList(1, revs.size())) {
-                    b.removeCommit(r);
-                }
-                // successfully updating the root document can be considered
-                // as success because the changes are not marked as committed
-                // anymore
-                success = true;
-            }
-            operations.remove("/");
-            // update remaining documents
-            for (UpdateOp op : operations.values()) {
-                store.findAndUpdate(Collection.NODES, op);
-            }
+            rev = apply(commit);
+            success = true;
         } finally {
             if (!success) {
                 canceled(commit);
@@ -846,7 +815,7 @@ public final class MongoNodeStore
                 done(commit, true, null);
             }
         }
-        return ancestor;
+        return rev;
     }
 
     @Nonnull
